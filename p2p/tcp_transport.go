@@ -25,10 +25,16 @@ type Message struct {
 type TCPPeer struct {
 	conn     net.Conn
 	outbound bool
+	trace    func(string, string)
 }
 
 func NewTCPPeer(conn net.Conn, outbound bool) *TCPPeer {
 	return &TCPPeer{conn: conn, outbound: outbound}
+}
+func (p *TCPPeer) emit(stage, detail string) {
+	if p.trace != nil {
+		p.trace(stage, detail)
+	}
 }
 func (p *TCPPeer) Write(m Message) error {
 	b, e := json.Marshal(m)
@@ -40,10 +46,14 @@ func (p *TCPPeer) Write(m Message) error {
 	}
 	var h [4]byte
 	binary.BigEndian.PutUint32(h[:], uint32(len(b)))
+	p.emit("encode", m.Op+" JSON + length prefix")
 	if _, e = io.Copy(p.conn, bytes.NewReader(h[:])); e != nil {
 		return e
 	}
 	_, e = io.Copy(p.conn, bytes.NewReader(b))
+	if e == nil {
+		p.emit("send", m.Op+" frame sent")
+	}
 	return e
 }
 func (p *TCPPeer) Read() (m Message, e error) {
@@ -60,6 +70,9 @@ func (p *TCPPeer) Read() (m Message, e error) {
 		return
 	}
 	e = json.Unmarshal(b, &m)
+	if e == nil {
+		p.emit("decode", m.Op+" frame decoded")
+	}
 	return
 }
 func (p *TCPPeer) handshake() error {
@@ -75,6 +88,7 @@ func (p *TCPPeer) handshake() error {
 	if m.Op != version {
 		return errors.New("incompatible protocol")
 	}
+	p.emit("handshake", "Protocol dfs/1 accepted")
 	if !p.outbound {
 		return p.Write(Message{Op: version})
 	}
@@ -88,6 +102,7 @@ type TCPTransport struct {
 	peers      map[net.Conn]struct{}
 	closed     bool
 	Handler    func(Message) Message
+	Trace      func(string, string)
 }
 
 func NewTCPTransport(addr string) *TCPTransport {
@@ -136,6 +151,8 @@ func (t *TCPTransport) handleConn(c net.Conn) {
 	defer func() { c.Close(); t.mu.Lock(); delete(t.peers, c); t.mu.Unlock() }()
 	c.SetDeadline(time.Now().Add(5 * time.Second))
 	p := NewTCPPeer(c, false)
+	p.trace = t.Trace
+	p.emit("connect", "Inbound TCP connection accepted")
 	if p.handshake() != nil {
 		return
 	}
@@ -160,7 +177,8 @@ func (t *TCPTransport) Close() error {
 	}
 	return nil
 }
-func Request(addr string, m Message) (Message, error) {
+func Request(addr string, m Message) (Message, error) { return RequestTrace(addr, m, nil) }
+func RequestTrace(addr string, m Message, trace func(string, string)) (Message, error) {
 	c, e := net.DialTimeout("tcp", addr, 2*time.Second)
 	if e != nil {
 		return Message{}, e
@@ -168,6 +186,8 @@ func Request(addr string, m Message) (Message, error) {
 	defer c.Close()
 	c.SetDeadline(time.Now().Add(5 * time.Second))
 	p := NewTCPPeer(c, true)
+	p.trace = trace
+	p.emit("connect", "TCP connected to "+addr)
 	if e = p.handshake(); e != nil {
 		return Message{}, e
 	}
@@ -175,4 +195,15 @@ func Request(addr string, m Message) (Message, error) {
 		return Message{}, e
 	}
 	return p.Read()
+}
+
+func (t *TCPTransport) Start(l net.Listener) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed || t.listener != nil {
+		return errors.New("already started")
+	}
+	t.listener = l
+	go t.startAcceptLoop(l)
+	return nil
 }

@@ -11,8 +11,14 @@ type Node struct {
 	store     *Store
 	transport *p2p.TCPTransport
 	peers     []string
+	trace     func(string, string)
 }
 
+func (n *Node) emit(stage, detail string) {
+	if n.trace != nil {
+		n.trace(stage, detail)
+	}
+}
 func NewNode(dir, addr string, peers []string) (*Node, error) {
 	s, e := NewStore(dir)
 	if e != nil {
@@ -38,10 +44,12 @@ func (n *Node) handle(m p2p.Message) p2p.Message {
 		if e := n.store.Put(m.Hash, m.Data); e != nil {
 			return p2p.Message{Op: "error", Error: "storage rejected"}
 		}
+		n.emit("store", "Replica stored "+m.Hash)
 		return p2p.Message{Op: "ok", Hash: m.Hash}
 	case "get":
 		b, e := n.store.Get(m.Hash)
 		if e == nil {
+			n.emit("retrieve", "Serving local replica "+m.Hash)
 			return p2p.Message{Op: "file", Hash: m.Hash, Data: b}
 		}
 		return p2p.Message{Op: "error", Error: "file unavailable"}
@@ -51,9 +59,11 @@ func (n *Node) handle(m p2p.Message) p2p.Message {
 }
 func (n *Node) Upload(b []byte) (string, int, error) {
 	h := digest(b)
+	n.emit("hash", "SHA-256: "+h)
 	if e := n.store.Put(h, b); e != nil {
 		return "", 0, e
 	}
+	n.emit("store", "Stored local copy "+h)
 	count := 1
 	var mu sync.Mutex
 	var wg sync.WaitGroup
@@ -64,10 +74,11 @@ func (n *Node) Upload(b []byte) (string, int, error) {
 		wg.Add(1)
 		go func(a string) {
 			defer wg.Done()
-			r, e := p2p.Request(a, p2p.Message{Op: "put", Hash: h, Data: b})
+			r, e := p2p.RequestTrace(a, p2p.Message{Op: "put", Hash: h, Data: b}, n.trace)
 			if e == nil && r.Op == "ok" && r.Hash == h {
 				mu.Lock()
 				count++
+				n.emit("replicate", "Replica acknowledged by "+a)
 				mu.Unlock()
 			}
 		}(addr)
@@ -83,17 +94,19 @@ func (n *Node) Download(h string) ([]byte, error) {
 		return nil, errors.New("invalid hash")
 	}
 	if b, e := n.store.Get(h); e == nil {
+		n.emit("retrieve", "Local hit "+h)
 		return b, nil
 	}
 	for _, a := range n.peers {
 		if a == n.transport.Addr() {
 			continue
 		}
-		r, e := p2p.Request(a, p2p.Message{Op: "get", Hash: h})
+		r, e := p2p.RequestTrace(a, p2p.Message{Op: "get", Hash: h}, n.trace)
 		if e == nil && r.Op == "file" && r.Hash == h && len(r.Data) <= p2p.MaxFile && digest(r.Data) == h {
 			if e = n.store.Put(h, r.Data); e != nil {
 				return nil, e
 			}
+			n.emit("retrieve", "Verified and cached remote copy from "+a)
 			return r.Data, nil
 		}
 	}
