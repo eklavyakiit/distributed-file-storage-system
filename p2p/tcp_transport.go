@@ -1,90 +1,178 @@
 package p2p
 
 import (
-	"fmt"
+	"bytes"
+	"encoding/binary"
+	"encoding/json"
+	"errors"
+	"io"
 	"net"
 	"sync"
+	"time"
 )
-//TCP Peer represents the remote node over a TCP established connection
-type TCPPeer struct{
-	//conn is underlying connection of the peer
-	conn net.Conn
 
-	//if we dial and retrieve a conn => outbound == true
-	//if we accept and retrieve a conn => outbound == false
+const MaxFile = 8 << 20
+const maxFrame = 12 << 20
+const version = "dfs/1"
+
+type Message struct {
+	Op    string `json:"op"`
+	Hash  string `json:"hash,omitempty"`
+	Data  []byte `json:"data,omitempty"`
+	Error string `json:"error,omitempty"`
+}
+
+type TCPPeer struct {
+	conn     net.Conn
 	outbound bool
 }
 
-func NewTCPPeer(conn net.Conn, outbound bool) *TCPPeer{
-	return &TCPPeer{
-		conn: conn,
-		outbound: outbound,
-	}
+func NewTCPPeer(conn net.Conn, outbound bool) *TCPPeer {
+	return &TCPPeer{conn: conn, outbound: outbound}
 }
-
-
-//RWMutex stands for Read-Write Mutual Exclusion
-//it allows multiple simultaenous read but no write simultaneously
-
-type TCPTransport struct {
-    listenAddr string
-    listener   net.Listener
-    mu         sync.RWMutex
-    peers      map[net.Addr]Peer
-}
-
-/* Info about the below function
- * NewTCPTransport acts as a factory function to initialize a new TCPTransport instance.
- *
- * What is happening here:
- *   When someone wants to set up a new TCP transport, this function allocates a fresh
- *   TCPTransport object in memory and saves the given address/port (e.g., ":4000")
- *   into its `listenAddress` variable. Think of it like writing the phone number on a
- *   sticky note before picking up the phone.
- *   (Note: It simply stores the string as-is—it does not validate the port or auto-assign
- *   a free port if left blank.)
- *
- * What is NOT happening yet:
- *   The server is NOT actually listening on that port yet. No network socket is open,
- *   and incoming connections cannot be accepted yet. You must call the listen function
- *   next to actually bind the port and start accepting traffic.
- */
-func NewTCPTransport(listenAddr string) *TCPTransport{ 
-	return &TCPTransport{
-		listenAddr: listenAddr,
+func (p *TCPPeer) Write(m Message) error {
+	b, e := json.Marshal(m)
+	if e != nil {
+		return e
 	}
-}
-//lets write a function where server start listening on that port number
-//It only listens (opens the port)—it doesn't have the loop to accept incoming connections yet.
-//just opening the gate for the visitors
-
-func (t *TCPTransport) ListenAndAccept() error{
-	var err error
-	t.listener, err = net.Listen("tcp", t.listenAddr) //Go asks the operating system to create a TCP listening socket and bind it to port 4000
-	if err !=nil{
-		return err
+	if len(b) > maxFrame {
+		return errors.New("frame too large")
 	}
-	go t.startAcceptLoop()
+	var h [4]byte
+	binary.BigEndian.PutUint32(h[:], uint32(len(b)))
+	if _, e = io.Copy(p.conn, bytes.NewReader(h[:])); e != nil {
+		return e
+	}
+	_, e = io.Copy(p.conn, bytes.NewReader(b))
+	return e
+}
+func (p *TCPPeer) Read() (m Message, e error) {
+	var h [4]byte
+	if _, e = io.ReadFull(p.conn, h[:]); e != nil {
+		return
+	}
+	n := binary.BigEndian.Uint32(h[:])
+	if n == 0 || n > maxFrame {
+		return m, errors.New("invalid frame size")
+	}
+	b := make([]byte, n)
+	if _, e = io.ReadFull(p.conn, b); e != nil {
+		return
+	}
+	e = json.Unmarshal(b, &m)
+	return
+}
+func (p *TCPPeer) handshake() error {
+	if p.outbound {
+		if e := p.Write(Message{Op: version}); e != nil {
+			return e
+		}
+	}
+	m, e := p.Read()
+	if e != nil {
+		return e
+	}
+	if m.Op != version {
+		return errors.New("incompatible protocol")
+	}
+	if !p.outbound {
+		return p.Write(Message{Op: version})
+	}
 	return nil
 }
 
-//the loop to recieve incoming messages from peers
-//the standing at the gate and shaking hands with the visitors
+type TCPTransport struct {
+	listenAddr string
+	listener   net.Listener
+	mu         sync.RWMutex
+	peers      map[net.Conn]struct{}
+	closed     bool
+	Handler    func(Message) Message
+}
 
-func (t *TCPTransport) startAcceptLoop(){
-	for{
-		conn, err := t.listener.Accept()
-		if err !=nil{
-			fmt.Printf("TCP accept error: %s\n", err)
+func NewTCPTransport(addr string) *TCPTransport {
+	return &TCPTransport{listenAddr: addr, peers: make(map[net.Conn]struct{})}
+}
+func (t *TCPTransport) ListenAndAccept() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed || t.listener != nil {
+		return errors.New("transport already started or closed")
+	}
+	l, e := net.Listen("tcp", t.listenAddr)
+	if e != nil {
+		return e
+	}
+	t.listener = l
+	go t.startAcceptLoop(l)
+	return nil
+}
+func (t *TCPTransport) Addr() string {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if t.listener == nil {
+		return t.listenAddr
+	}
+	return t.listener.Addr().String()
+}
+func (t *TCPTransport) startAcceptLoop(l net.Listener) {
+	for {
+		c, e := l.Accept()
+		if e != nil {
+			return
+		}
+		t.mu.Lock()
+		if t.closed || len(t.peers) >= 32 {
+			t.mu.Unlock()
+			c.Close()
 			continue
 		}
-		go t.handleConn(conn)
+		t.peers[c] = struct{}{}
+		t.mu.Unlock()
+		go t.handleConn(c)
 	}
 }
-func (t *TCPTransport) handleConn(conn net.Conn){
-	peer := NewTCPPeer(conn, true)
-	fmt.Printf("new incoming connection: %+v\n", peer)
+func (t *TCPTransport) handleConn(c net.Conn) {
+	defer func() { c.Close(); t.mu.Lock(); delete(t.peers, c); t.mu.Unlock() }()
+	c.SetDeadline(time.Now().Add(5 * time.Second))
+	p := NewTCPPeer(c, false)
+	if p.handshake() != nil {
+		return
+	}
+	m, e := p.Read()
+	if e != nil {
+		return
+	}
+	if t.Handler == nil {
+		return
+	}
+	_ = p.Write(t.Handler(m))
 }
-
-
-
+func (t *TCPTransport) Close() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.closed = true
+	for c := range t.peers {
+		c.Close()
+	}
+	if t.listener != nil {
+		return t.listener.Close()
+	}
+	return nil
+}
+func Request(addr string, m Message) (Message, error) {
+	c, e := net.DialTimeout("tcp", addr, 2*time.Second)
+	if e != nil {
+		return Message{}, e
+	}
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(5 * time.Second))
+	p := NewTCPPeer(c, true)
+	if e = p.handshake(); e != nil {
+		return Message{}, e
+	}
+	if e = p.Write(m); e != nil {
+		return Message{}, e
+	}
+	return p.Read()
+}
