@@ -5,6 +5,23 @@ import (
 	"net"
 	"sync"
 )
+//TCP Peer represents the remote node over a TCP established connection
+type TCPPeer struct{
+	//conn is underlying connection of the peer
+	conn net.Conn
+
+	//if we dial and retrieve a conn => outbound == true
+	//if we accept and retrieve a conn => outbound == false
+	outbound bool
+}
+
+func NewTCPPeer(conn net.Conn, outbound bool) *TCPPeer{
+	return &TCPPeer{
+		conn: conn,
+		outbound: outbound,
+	}
+}
+
 
 //RWMutex stands for Read-Write Mutual Exclusion
 //it allows multiple simultaenous read but no write simultaneously
@@ -52,7 +69,7 @@ func (t *TCPTransport) ListenAndAccept() error{
 }
 
 //the loop to recieve incoming messages from peers
-//the stabding at the gate and shaking hands with the visitors
+//the standing at the gate and shaking hands with the visitors
 
 func (t *TCPTransport) startAcceptLoop(){
 	for{
@@ -65,7 +82,8 @@ func (t *TCPTransport) startAcceptLoop(){
 	}
 }
 func (t *TCPTransport) handleConn(conn net.Conn){
-	fmt.Printf("new incoming connection: %+v\n", conn)
+	peer := NewTCPPeer(conn, true)
+	fmt.Printf("new incoming connection: %+v\n", peer)
 }
 
 
